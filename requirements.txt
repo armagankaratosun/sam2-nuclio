@@ -1,0 +1,13 @@
+torch
+numpy
+pillow
+label-studio-ml
+label-studio-sdk
+boto3
+redis
+rq
+nuclio-sdk
+optree>=0.13.0
+msgpack
+git+https://github.com/HumanSignal/label-studio-ml-backend.git@master#egg=label_studio_ml
+
