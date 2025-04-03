@@ -137,7 +137,7 @@ nuctl deploy --project-name ml-backends --file sam2-nuclio.yaml --namespace <you
 ```
 
 ## Author
-Armagan Karatosunx
+Armagan Karatosun
 
 ## References
 
