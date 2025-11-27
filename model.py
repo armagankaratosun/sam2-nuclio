@@ -1,15 +1,19 @@
-import torch
-import numpy as np
-import os
-import sys
+import base64
 import json
+import os
 import pathlib
-from typing import List, Dict, Optional
+import sys
+import time
+from typing import Dict, List, Optional
 from uuid import uuid4
+
+import numpy as np
+import requests
+import torch
 from label_studio_ml.model import LabelStudioMLBase
 from label_studio_ml.response import ModelResponse
-from label_studio_sdk.converter import brush
 from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_local_path
+from label_studio_sdk.converter import brush
 from PIL import Image
 
 ROOT_DIR = os.getcwd()
@@ -19,6 +23,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 import logging
 logger = logging.getLogger(__name__)
+_log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _log_level, logging.INFO))
 
 
 DEVICE = os.getenv('DEVICE', 'cuda')
@@ -59,6 +65,119 @@ class DummyLabelInterface:
         # Returns the provided names and a default key ("image") to access image URL from the task data.
         return from_name, to_name, "image"
 
+
+class LabelStudioAuthManager:
+    """Refreshes PATs and falls back to legacy tokens for media downloads."""
+
+    def __init__(self):
+        self.hostname = os.getenv("LABEL_STUDIO_HOST") or os.getenv("LABEL_STUDIO_URL")
+        self._raw_token = os.getenv("LABEL_STUDIO_API_KEY") or os.getenv("LABEL_STUDIO_ACCESS_TOKEN")
+        self._verify_ssl = self._to_bool(os.getenv("LABEL_STUDIO_VERIFY_SSL") or os.getenv("VERIFY_SSL"), True)
+        self._refresh_leeway = int(os.getenv("LABEL_STUDIO_TOKEN_REFRESH_LEEWAY", "30"))
+        self._fallback_ttl = int(os.getenv("LABEL_STUDIO_ACCESS_TOKEN_TTL", "240"))
+        self._request_timeout = int(os.getenv("LABEL_STUDIO_TOKEN_REQUEST_TIMEOUT", "10"))
+
+        self._should_refresh = None
+        self._access_token = None
+        self._access_token_exp = None
+        self._last_refresh = None
+
+    @staticmethod
+    def _to_bool(value, default):
+        if value is None:
+            return default
+        return str(value).lower() not in {"0", "false", "no"}
+
+    def get_access_token(self) -> Optional[str]:
+        if not self._raw_token:
+            return None
+        if self._should_refresh is None:
+            self._should_refresh = self._attempt_to_enable_refresh()
+        if not self._should_refresh:
+            return self._raw_token
+        if self._access_token is None or self._token_expiring():
+            self._refresh_access_token()
+        return self._access_token
+
+    def _attempt_to_enable_refresh(self) -> bool:
+        logger.debug("Attempting Label Studio token refresh flow.")
+        success = self._refresh_access_token(swallow_errors=True)
+        if success:
+            logger.info("Using Label Studio Personal Access Token (auto refresh enabled).")
+        else:
+            logger.info("Using legacy Label Studio token (no refresh flow detected).")
+        return success
+
+    def _token_expiring(self) -> bool:
+        if self._access_token_exp:
+            return (time.time() + self._refresh_leeway) >= self._access_token_exp
+        if self._last_refresh is None:
+            return True
+        return (time.time() - self._last_refresh) >= max(self._fallback_ttl - self._refresh_leeway, 0)
+
+    def _refresh_access_token(self, swallow_errors: bool = False) -> bool:
+        if not self.hostname:
+            message = "LABEL_STUDIO_HOST or LABEL_STUDIO_URL must be set to refresh Personal Access Tokens."
+            if swallow_errors:
+                logger.warning(message)
+                return False
+            raise RuntimeError(message)
+
+        refresh_url = f"{self.hostname.rstrip('/')}/api/token/refresh"
+        logger.debug("Refreshing Label Studio token via %s", refresh_url)
+        try:
+            response = requests.post(
+                refresh_url,
+                json={"refresh": self._raw_token},
+                timeout=self._request_timeout,
+                verify=self._verify_ssl,
+            )
+        except requests.RequestException as exc:
+            if swallow_errors:
+                logger.warning("Unable to refresh Label Studio token: %s", exc)
+                return False
+            raise
+
+        if response.status_code >= 400:
+            if swallow_errors and response.status_code in (400, 401, 403, 404):
+                logger.warning(
+                    "Label Studio token refresh endpoint rejected the configured token (status=%s): %s. "
+                    "Falling back to legacy token flow.",
+                    response.status_code,
+                    response.text,
+                )
+                return False
+            response.raise_for_status()
+
+        data = response.json()
+        access_token = data.get("access")
+        if not access_token:
+            raise RuntimeError("Label Studio token refresh response is missing 'access'.")
+
+        self._access_token = access_token
+        self._access_token_exp = self._decode_expiration(access_token)
+        self._last_refresh = time.time()
+        logger.info(
+            "Label Studio access token refreshed successfully (expires at %s).",
+            self._access_token_exp,
+        )
+        return True
+
+    def _decode_expiration(self, token: str) -> Optional[int]:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        payload = parts[1]
+        padding = "=" * (-len(payload) % 4)
+        try:
+            decoded = base64.urlsafe_b64decode((payload + padding).encode("utf-8")).decode("utf-8")
+            payload_data = json.loads(decoded)
+            exp_value = payload_data.get("exp")
+            return int(exp_value) if exp_value is not None else None
+        except Exception as exc:
+            logger.warning("Unable to decode Label Studio token expiration: %s", exc)
+            return None
+
 # -----------------------------------------------------------------------------
 # Sam2Nuclio Model
 # -----------------------------------------------------------------------------
@@ -80,6 +199,7 @@ class Sam2Nuclio(LabelStudioMLBase):
             self.set("model_version", "v1.0")
         if not hasattr(self, "label_interface"):
             self.label_interface = DummyLabelInterface()
+        self.ls_auth = LabelStudioAuthManager()
 
     def get_results(self, masks, probs, width, height, from_name, to_name, label):
         """
@@ -122,7 +242,13 @@ class Sam2Nuclio(LabelStudioMLBase):
         """
         Loads the image from a URL (using get_local_path) and sets it on the predictor.
         """
-        image_path = get_local_path(image_url, task_id=task_id)
+        access_token = self.ls_auth.get_access_token()
+        kwargs = {"task_id": task_id}
+        if self.ls_auth.hostname:
+            kwargs["hostname"] = self.ls_auth.hostname
+        if access_token:
+            kwargs["access_token"] = access_token
+        image_path = get_local_path(image_url, **kwargs)
         image = Image.open(image_path)
         image = np.array(image.convert("RGB"))
         predictor.set_image(image)

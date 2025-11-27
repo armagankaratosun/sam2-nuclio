@@ -58,10 +58,16 @@ Configure your Nuclio function with the following environment variables:
 - `DEVICE`: `cuda`
 - `PYTHONPATH`: `/opt/nuclio/segment-anything-2`
 - `LABEL_STUDIO_HOST`: `https://<YOUR_LABEL_STUDIO_HOST>:<PORT>`
-- `LABEL_STUDIO_ACCESS_TOKEN`: `<YOUR_API_KEY>`
+- `LABEL_STUDIO_API_KEY`: `<YOUR_PERSONAL_ACCESS_TOKEN>` *(legacy `LABEL_STUDIO_ACCESS_TOKEN` still works but won't refresh automatically)*
 - `LOG_LEVEL`: `DEBUG` *(Set to INFO in production)*
 
-`LABEL_STUDIO_HOST` and `LABEL_STUDIO_ACCESS_TOKEN` is only needed if you want to download images from the Label Studio instance to the SAM ML Backend
+`LABEL_STUDIO_HOST` and `LABEL_STUDIO_API_KEY` are only needed if you want to download images from the Label Studio instance to the SAM ML Backend.
+
+### Authenticating to Label Studio
+
+Label Studio Personal Access Tokens (PATs) behave differently from legacy tokens: they are JWT refresh tokens and cannot be sent directly to endpoints such as `/tasks/<id>/presign`. This backend now exchanges your PAT (provided via `LABEL_STUDIO_API_KEY`) for a short-lived bearer token using `POST /api/token/refresh`, caches it, and refreshes it automatically before it expires (~5 minutes). The bearer token is then passed to the Label Studio SDK helper so downloading task media keeps working even when PATs are mandatory.
+
+If you still rely on legacy tokens, set `LABEL_STUDIO_ACCESS_TOKEN` instead—they will be forwarded unchanged, but they won't benefit from the refresh flow once PATs become the only option.
 
 ## Quickstart
 
@@ -109,8 +115,8 @@ spec:
       value: "/opt/nuclio/segment-anything-2"
     - name: LABEL_STUDIO_HOST
       value: "https://<YOUR_LABEL_STUDIO_HOST>:<PORT>"
-    - name: LABEL_STUDIO_ACCESS_TOKEN
-      value: "<YOUR_API_KEY>"
+    - name: LABEL_STUDIO_API_KEY
+      value: "<YOUR_PERSONAL_ACCESS_TOKEN>"
     - name: LOG_LEVEL
       value: INFO
 
@@ -157,4 +163,3 @@ Armagan Karatosun
 - **Nuclio Serverless Platform:**
   - [Nuclio Documentation](https://nuclio.io/)
   - [Nuclio GitHub Repository](https://github.com/nuclio/nuclio)
-
